@@ -1,0 +1,78 @@
+@startuml c4-container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_TOP_DOWN()
+
+title Маркетплейс — C4 Container
+
+Person(buyer, "Покупатель", "Просматривает ленту, оформляет и оплачивает заказы")
+Person(seller, "Продавец", "Управляет товарами, остатками и заказами")
+
+System_Ext(psp, "Платёжный провайдер (PSP)", "Приём платежей, возвраты, выплаты продавцам")
+System_Ext(delivery, "Провайдеры уведомлений", "Email / SMS / Push")
+
+System_Boundary(mp, "Маркетплейс") {
+    Container(web, "Web / Mobile клиенты", "SPA, iOS, Android", "Витрина для покупателей и кабинет продавца")
+    Container(gw, "API Gateway", "Envoy / Nginx", "Единая точка входа: маршрутизация, проверка JWT, rate limiting")
+
+    Container(user, "User Service", "Python, FastAPI", "Регистрация, аутентификация, профили покупателей и продавцов, роли")
+    ContainerDb(userdb, "User DB", "PostgreSQL", "Учётные записи, хэши паролей, профили, адреса, статус верификации продавца")
+
+    Container(catalog, "Catalog Service", "Python, FastAPI", "Товары, категории, цены, остатки, резервирование")
+    ContainerDb(catalogdb, "Catalog DB", "PostgreSQL", "Карточки товаров, категории, цены, остатки, резервы")
+    ContainerDb(media, "Media Storage", "S3-совместимое хранилище", "Изображения товаров")
+
+    Container(feed, "Feed Service", "Python, FastAPI", "Персонализированная лента и поиск, сбор поведенческих событий")
+    ContainerDb(feedidx, "Feed Index", "OpenSearch", "Денормализованный поисковый индекс товаров")
+    ContainerDb(feedcache, "Feed Profile Store", "Redis", "Профили интересов пользователей, кэш готовых лент")
+
+    Container(order, "Order Service", "Python, FastAPI", "Корзина, оформление заказа, жизненный цикл заказа (оркестрация шагов)")
+    ContainerDb(orderdb, "Order DB", "PostgreSQL", "Корзины, заказы, позиции со снимком цены, история статусов, outbox")
+
+    Container(payment, "Payment Service", "Python, FastAPI", "Платежи, возвраты, учёт (ledger), комиссия, выплаты продавцам")
+    ContainerDb(paymentdb, "Payment DB", "PostgreSQL", "Платежи, двойная запись в ledger, реквизиты выплат, outbox")
+
+    Container(notify, "Notification Service", "Python, FastAPI", "Шаблоны и отправка уведомлений о статусах заказов")
+    ContainerDb(notifydb, "Notification DB", "PostgreSQL", "Шаблоны, настройки каналов, реплика контактов, журнал отправок")
+
+    ContainerQueue(bus, "Event Bus", "Apache Kafka", "Доменные события: user.*, catalog.*, order.*, payment.*, feed.events")
+}
+
+Rel(buyer, web, "Использует", "HTTPS")
+Rel(seller, web, "Использует", "HTTPS")
+Rel(web, gw, "API-запросы", "HTTPS / JSON")
+
+Rel(gw, user, "Аутентификация, профили", "sync, HTTP/REST")
+Rel(gw, catalog, "Управление каталогом (продавец), карточка товара", "sync, HTTP/REST")
+Rel(gw, feed, "Лента, поиск, поведенческие события", "sync, HTTP/REST")
+Rel(gw, order, "Корзина, заказы", "sync, HTTP/REST")
+Rel(gw, payment, "Статус оплаты, история выплат", "sync, HTTP/REST")
+
+Rel(order, catalog, "Проверка цены и резерв остатков", "sync, gRPC")
+Rel(order, payment, "Создание платежа", "sync, gRPC")
+Rel(payment, psp, "Платежи, возвраты, выплаты", "sync, HTTPS")
+Rel(psp, payment, "Webhook о результате платежа", "HTTPS")
+
+Rel(user, userdb, "Чтение / запись", "SQL")
+Rel(catalog, catalogdb, "Чтение / запись", "SQL")
+Rel(catalog, media, "Загрузка изображений", "S3 API")
+Rel(feed, feedidx, "Индексация / запросы", "HTTP")
+Rel(feed, feedcache, "Чтение / запись", "RESP")
+Rel(order, orderdb, "Чтение / запись", "SQL")
+Rel(payment, paymentdb, "Чтение / запись", "SQL")
+Rel(notify, notifydb, "Чтение / запись", "SQL")
+
+Rel(user, bus, "user.registered, user.updated", "async, publish")
+Rel(catalog, bus, "catalog.product.*, catalog.stock.changed", "async, publish")
+Rel(order, bus, "order.created, order.status_changed", "async, publish")
+Rel(payment, bus, "payment.succeeded, payment.failed, payment.refunded", "async, publish")
+Rel(feed, bus, "feed.events (просмотры, клики)", "async, publish")
+
+Rel(bus, catalog, "order.status_changed → подтверждение / снятие резерва; user.* → статус продавца", "async, consume")
+Rel(bus, order, "payment.* → смена статуса заказа", "async, consume")
+Rel(bus, feed, "catalog.product.*, order.status_changed, feed.events", "async, consume")
+Rel(bus, notify, "order.status_changed, payment.*, user.*", "async, consume")
+Rel(notify, delivery, "Отправка сообщений", "sync, HTTPS")
+
+SHOW_LEGEND()
+@enduml

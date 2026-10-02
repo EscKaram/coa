@@ -1,0 +1,11 @@
+services:
+  catalog-service:
+    build:
+      context: ./services/catalog-service
+    image: marketplace/catalog-service:0.1.0
+    container_name: catalog-service
+    environment:
+      SERVICE_VERSION: "0.1.0"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
