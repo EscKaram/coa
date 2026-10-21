@@ -1,376 +1,236 @@
-# Маркетплейс — архитектурное проектирование
+# ДЗ 2. Marketplace: OpenAPI + CRUD
 
-Архитектура маркетплейса: продавцы размещают товары, покупатели оформляют и оплачивают заказы.
-В репозитории есть C4 Container диаграмма, описание доменов, данных и взаимодействий, сравнение вариантов декомпозиции и один сервис (`catalog-service`), который поднимается в Docker и отвечает `200 OK` на `/health`.
+API маркетплейса, спроектированное от контракта: товары (CRUD с мягким удалением), заказы с бизнес-логикой, промокоды, JWT-аутентификация и роли.
 
-Бизнес-логики здесь нет, так требует задание.
+Условие задания: [`docs/hw2-assignment.md`](docs/hw2-assignment.md). ДЗ 1 лежит в ветке [`hw1`](../../tree/hw1).
+
+**Стек:** Python 3.12, FastAPI, SQLAlchemy 2 (async) + asyncpg, PostgreSQL 16, Flyway, openapi-generator (python-fastapi).
 
 ---
 
 ## 1. Быстрый старт
 
-### Требования
-
-- Docker Engine 20.10+ с плагином Docker Compose v2 (`docker compose`).
-
-### Запуск через docker compose
+Нужен только Docker (Engine 20.10+ с Compose v2).
 
 ```bash
-docker compose up --build -d
-curl -i http://localhost:8000/health
+docker compose up --build          # postgres → flyway migrate → app
 ```
 
-Ожидаемый ответ:
+Что происходит при запуске:
 
-```
-HTTP/1.1 200 OK
-content-type: application/json
+1. `postgres` поднимается и проходит healthcheck.
+2. `flyway` применяет миграции из `db/migrations` и завершается с кодом 0.
+3. `app` собирается. На первом этапе Dockerfile генерирует код из `openapi/openapi.yaml`. При старте создаётся администратор из `ADMIN_EMAIL` / `ADMIN_PASSWORD`.
 
-{"status":"ok","service":"catalog-service","version":"0.1.0"}
-```
+| Что | Адрес |
+|---|---|
+| API | http://localhost:8080 |
+| Swagger UI | http://localhost:8080/docs |
+| PostgreSQL | `localhost:5433`, БД / пользователь / пароль: `marketplace` |
+| Администратор | `admin@marketplace.local` / `admin12345` |
 
-Статус встроенного Docker HEALTHCHECK:
+E2E-проверка всех сценариев (76 проверок, нужен только Python 3 из стандартной поставки):
 
 ```bash
-docker inspect --format '{{.State.Health.Status}}' catalog-service   # healthy
+python3 tests/e2e.py
 ```
 
-Остановка:
+Остановка: `docker compose down`, с удалением данных: `docker compose down -v`.
 
-```bash
-docker compose down
-```
+### Конфигурация (`docker-compose.yml`)
 
-### Запуск без compose
-
-```bash
-docker build -t marketplace/catalog-service:0.1.0 services/catalog-service
-docker run --rm -p 8000:8000 marketplace/catalog-service:0.1.0
-```
-
-### Локальный запуск без Docker
-
-```bash
-cd services/catalog-service
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --port 8000
-```
-
-### Внешние зависимости сервиса
-
-| Зависимость | Версия | Назначение |
+| Переменная | По умолчанию | Назначение |
 |---|---|---|
-| `fastapi` | 0.115.6 | HTTP-фреймворк |
-| `uvicorn` | 0.34.0 | ASGI-сервер |
-| `python:3.12-slim` | — | Базовый Docker-образ |
+| `ORDER_RATE_LIMIT_MINUTES` | `1` | N из задания: интервал между `CREATE_ORDER` (и между `UPDATE_ORDER`) одного пользователя. `0` отключает лимит |
+| `ACCESS_TOKEN_TTL_MINUTES` | `15` | Время жизни access token |
+| `REFRESH_TOKEN_TTL_DAYS` | `7` | Время жизни refresh token |
+| `JWT_SECRET` | — | Ключ подписи HS256 |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | — | Учётная запись ADMIN, создаётся при старте |
 
 ---
 
-## 2. Структура репозитория
+## 2. Структура
 
 ```
 .
-├── README.md                     # архитектура, решения, инструкция запуска
-├── docker-compose.yml            # запуск catalog-service
-├── docs/
-│   ├── c4-container.puml         # C4 Container диаграмма (C4-PlantUML)
-│   └── c4-container.png          # отрисованная диаграмма
-└── services/
-    └── catalog-service/
-        ├── Dockerfile
-        ├── requirements.txt
-        └── app/
-            └── main.py           # GET /health
+├── openapi/
+│   ├── openapi.yaml            # контракт: эндпоинты, схемы, ограничения, ошибки, security
+│   └── templates/              # 4 переопределённых шаблона генератора (см. раздел 3)
+├── scripts/generate.sh         # генерация кода, одна команда
+├── generated/                  # сгенерированный код (в .gitignore)
+├── db/migrations/V1__init_schema.sql   # Flyway
+├── app/
+│   ├── main.py                 # сборка приложения из сгенерированных роутеров
+│   ├── impl/                   # реализации сгенерированных Base*Api
+│   ├── services/               # бизнес-логика: products, orders, promo_codes, auth
+│   ├── tables.py               # ORM-отображение таблиц
+│   ├── security.py             # пароли, JWT, проверка ролей
+│   ├── errors.py               # формат Error и обработчики исключений
+│   └── request_logging.py      # JSON-лог каждого запроса, X-Request-Id
+├── tests/e2e.py                # E2E-сценарии против запущенного сервиса
+├── Dockerfile                  # этап 1 — кодогенерация, этап 2 — приложение
+├── docker-compose.yml
+└── Makefile
 ```
 
 ---
 
-## 3. C4 Container диаграмма
+## 3. Кодогенерация
 
-Основная версия диаграммы лежит в [`docs/c4-container.puml`](docs/c4-container.puml) (нотация [C4-PlantUML](https://github.com/plantuml-stdlib/C4-PlantUML)), готовая картинка в [`docs/c4-container.png`](docs/c4-container.png).
-
-![C4 Container](docs/c4-container.png)
-
-Отрисовать её можно на [plantuml.com](https://www.plantuml.com/plantuml), в плагине PlantUML для IDE или командой `docker run --rm -v "$PWD/docs:/data" plantuml/plantuml /data/c4-container.puml`.
-
-Ниже та же диаграмма в Mermaid, GitHub отрисует её прямо на странице. Связи с базами данных не показаны: у каждого сервиса своя БД, полный список хранилищ есть в разделе 6.
-
-```mermaid
-C4Container
-    title Маркетплейс — C4 Container
-
-    Person(buyer, "Покупатель", "Лента, заказы, оплата")
-    Person(seller, "Продавец", "Каталог, остатки, заказы")
-
-    System_Boundary(mp, "Маркетплейс") {
-        Container(web, "Web / Mobile клиенты", "SPA, iOS, Android", "Витрина и кабинет продавца")
-        Container(gw, "API Gateway", "Envoy / Nginx", "Маршрутизация, проверка JWT, rate limiting")
-
-        Container(user, "User Service", "Python, FastAPI", "Аутентификация, профили, роли")
-        Container(catalog, "Catalog Service", "Python, FastAPI", "Товары, цены, остатки, резервы")
-        Container(feed, "Feed Service", "Python, FastAPI", "Персонализированная лента и поиск")
-        Container(order, "Order Service", "Python, FastAPI", "Корзина, заказы, статусы")
-        Container(payment, "Payment Service", "Python, FastAPI", "Платежи, ledger, выплаты")
-        Container(notify, "Notification Service", "Python, FastAPI", "Уведомления о статусах")
-
-        ContainerQueue(bus, "Event Bus", "Apache Kafka", "Доменные события")
-
-        ContainerDb(userdb, "User DB", "PostgreSQL")
-        ContainerDb(catalogdb, "Catalog DB", "PostgreSQL + S3")
-        ContainerDb(feeddb, "Feed Index", "OpenSearch + Redis")
-        ContainerDb(orderdb, "Order DB", "PostgreSQL")
-        ContainerDb(paymentdb, "Payment DB", "PostgreSQL")
-        ContainerDb(notifydb, "Notification DB", "PostgreSQL")
-    }
-
-    System_Ext(psp, "Платёжный провайдер", "Приём платежей и выплаты")
-    System_Ext(channels, "Email / SMS / Push", "Доставка сообщений")
-
-    Rel(buyer, web, "Использует", "HTTPS")
-    Rel(seller, web, "Использует", "HTTPS")
-    Rel(web, gw, "API", "HTTPS/JSON")
-
-    Rel(gw, user, "REST", "sync")
-    Rel(gw, catalog, "REST", "sync")
-    Rel(gw, feed, "REST", "sync")
-    Rel(gw, order, "REST", "sync")
-    Rel(gw, payment, "REST", "sync")
-
-    Rel(order, catalog, "Цена, резерв", "sync gRPC")
-    Rel(order, payment, "Создать платёж", "sync gRPC")
-    Rel(payment, psp, "Платежи", "HTTPS")
-
-    Rel(user, bus, "user.*", "async")
-    Rel(catalog, bus, "catalog.*", "async")
-    Rel(order, bus, "order.*", "async")
-    Rel(payment, bus, "payment.*", "async")
-    Rel(bus, catalog, "order.*, user.*", "async")
-    Rel(bus, notify, "order.*, payment.*, user.*", "async")
-    Rel(bus, feed, "catalog.*, order.*, feed.events", "async")
-    Rel(notify, channels, "Отправка", "HTTPS")
-
-    UpdateLayoutConfig($c4ShapeInRow="4", $c4BoundaryInRow="1")
+```bash
+make generate     # = docker run openapitools/openapi-generator-cli:v7.10.0 ... scripts/generate.sh
 ```
 
----
+- Генератор: `openapi-generator` 7.10.0, `python-fastapi`. Результат пишется в `generated/marketplace_api/`, каталог в `.gitignore`.
+- При `docker compose up --build` код генерируется заново на этапе `codegen` в Dockerfile, ручной шаг не нужен.
+- Из сгенерированного кода используются:
+  - **роутеры** (`marketplace_api.apis.*_api`): FastAPI-эндпоинты, параметры и тела запросов;
+  - **базовые классы** (`*_api_base.Base*Api`): их реализуют классы из `app/impl/`;
+  - **модели** (`marketplace_api.models.*`): pydantic-модели запросов и ответов с ограничениями из спецификации. Ручных DTO нет;
+  - `security_api.get_token_bearerAuth`: зависимость аутентификации. Её заменяет `app.security.authenticate` через `dependency_overrides`.
+- Переопределены 4 шаблона (`openapi/templates/`), чтобы исправить недостатки штатного генератора:
 
-## 4. Домены и зоны ответственности
+| Шаблон | Что исправлено |
+|---|---|
+| `endpoint_argument_definition.mustache` | обязательное тело запроса было `Body(None)`, стало `Body(...)`; `pattern` для path-параметров (UUID); целые query-параметры принимаются как `int`, а не `strict int` (иначе `?page=0` отклоняется) |
+| `api.mustache` | `status_code` берётся из первого ответа в спецификации (`201` для POST-создания); в реализацию передаётся проверенный токен |
+| `base_api.mustache` | в сигнатуры методов добавлен параметр `token: TokenModel` |
+| `extra_models.mustache` | в `TokenModel` добавлен `role` |
 
-| # | Домен | Тип | За что отвечает |
-|---|---|---|---|
-| 1 | **Identity & Access** | Supporting | Регистрация, аутентификация, выпуск и обновление токенов (JWT), роли (`buyer`, `seller`, `admin`). |
-| 2 | **User Profile** | Supporting | Профиль покупателя (контакты, адреса доставки), профиль продавца (юр. данные, статус верификации). |
-| 3 | **Catalog** | Core | Карточки товаров, категории и атрибуты, цены, медиа, публикация и снятие с продажи. |
-| 4 | **Inventory** | Core | Складские остатки продавца, резервирование под заказ, подтверждение и снятие резерва. |
-| 5 | **Feed & Search** | Core | Сбор поведенческих событий (просмотры, клики, покупки), профиль интересов, ранжирование ленты, полнотекстовый поиск. |
-| 6 | **Ordering** | Core | Корзина, оформление заказа, снимок цены на момент заказа, машина состояний заказа (`created → awaiting_payment → paid → shipped → delivered` / `cancelled`). |
-| 7 | **Payments & Billing** | Core | Создание платежа во внешнем PSP, обработка webhook, возвраты, учёт по двойной записи (ledger), удержание комиссии площадки, выплаты продавцам. |
-| 8 | **Notifications** | Generic | Шаблоны сообщений, выбор канала (email / SMS / push), пользовательские настройки подписок, журнал доставки. |
-
-**Персонализация (сколько её и как она устроена).** Первая версия работает без ML-моделей:
-
-1. **Кандидаты.** Из OpenSearch берутся опубликованные товары, которые есть в наличии, из категорий, с которыми пользователь недавно взаимодействовал, плюс общий популярный пул.
-2. **Ранжирование.** Скор считается как взвешенная сумма трёх составляющих: совпадение с профилем интересов (веса категорий и брендов по просмотрам и покупкам с затуханием по времени), популярность товара за скользящее окно и свежесть. Веса задаются конфигурацией.
-3. **Холодный старт.** Для анонимных и новых пользователей лента строится по популярности.
-4. **Профиль интересов** пересчитывается асинхронно из потока событий и хранится в Redis.
-
-Следующие шаги (за рамками задания): коллаборативная фильтрация, ML-ранжирование, A/B-тесты. Их можно добавить внутри Feed Service, и контракты с другими сервисами при этом не меняются.
+Как проходит запрос: сгенерированный роутер → валидация pydantic-моделью → `authenticate` (JWT) → `app/impl/*` → `app/services/*` → PostgreSQL.
 
 ---
 
-## 5. Распределение доменов по сервисам
+## 4. Соответствие требованиям
 
-| Сервис | Домены | Почему они вместе / отдельно |
+| № | Требование | Где реализовано |
 |---|---|---|
-| **API Gateway** | — (инфраструктура) | Бизнес-логики нет. Один вход для клиентов: TLS, проверка JWT по публичному ключу User Service, rate limiting, маршрутизация. |
-| **User Service** | Identity & Access, User Profile | Учётная запись и профиль описывают одну сущность и меняются вместе. Если разнести их по сервисам, при регистрации понадобится распределённая транзакция, а пользы от этого не будет. |
-| **Catalog Service** | Catalog, Inventory | Резерв остатков нужно проверять в одной ACID-транзакции с актуальной ценой и статусом публикации. Если вынести Inventory отдельно, проверка «товар опубликован и есть в наличии» станет распределённой. |
-| **Feed Service** | Feed & Search | Нагрузка в основном на чтение, хранилища специализированные (поисковый индекс, кэш), меняется сервис часто (эксперименты с ранжированием). Масштабируется независимо от транзакционного контура. Его отказ не должен мешать оформлению заказа. |
-| **Order Service** | Ordering | Здесь проходят все шаги оформления: резерв, платёж, смена статусов. Корзина живёт рядом с заказом, потому что при checkout корзина превращается в заказ. |
-| **Payment Service** | Payments & Billing | Финансовые данные требуют отдельного контура: строгий аудит, неизменяемый ledger, ограниченный доступ, отдельный цикл релизов. Платёж и учёт по нему держатся вместе, иначе пришлось бы сверять две системы между собой. |
-| **Notification Service** | Notifications | Работает полностью асинхронно, зависит от внешних провайдеров и даёт всплески нагрузки. Если провайдер отказал, на заказы и платежи это не влияет. |
+| 1 | CRUD `/products`, пагинация `page`/`size`, фильтры `status`/`category`, ответ с `totalElements` | `openapi.yaml`, `services/products.py` |
+| 2 | Схемы `ProductCreate` / `ProductUpdate` / `ProductResponse`, `format: decimal / date-time / uuid`, `enum`, `nullable`, `required` | `openapi.yaml → components.schemas` |
+| 3 | Кодогенерация одной командой, код в `.gitignore`, генерация при сборке | раздел 3 |
+| 4 | PostgreSQL, Flyway, индекс `idx_products_status`, `created_at` (default) / `updated_at` (триггер `set_updated_at`), мягкое удаление | `db/migrations/V1__init_schema.sql`, `archive_product` |
+| 5 | Единый формат `Error {error_code, message, details}`, каталог кодов в `ErrorCode` | `openapi.yaml`, `app/errors.py` |
+| 6 | Ограничения в OpenAPI (`minLength`, `maximum`, `minItems`, `pattern`…), `VALIDATION_ERROR` с полями в `details.fields` | сгенерированные модели + обработчик `RequestValidationError` |
+| 7 | Создание / обновление / отмена заказа, машина состояний, промокоды, всё в одной транзакции | `services/orders.py`, `services/promo_codes.py` |
+| 8 | JSON-лог каждого запроса: `request_id`, `method`, `endpoint`, `status_code`, `duration_ms`, `user_id`, `timestamp`, тело мутирующих запросов с маской паролей; `X-Request-Id` в ответе | `app/request_logging.py` |
+| 9 | `/auth/register`, `/auth/login`, `/auth/refresh`; access 15 мин, refresh 7 дней; `TOKEN_EXPIRED` / `TOKEN_INVALID` / `REFRESH_TOKEN_INVALID` | `app/security.py`, `services/auth.py` |
+| 10 | Роли `USER` / `SELLER` / `ADMIN` в claim `role`, `seller_id` у товара, `ACCESS_DENIED`, матрица доступа в описании спецификации | `require_role`, `_check_can_manage`, `_check_owner` |
 
-Правило разбиения: **один bounded context = один сервис**. Два контекста объединяются в один сервис, только если им нужна общая транзакционная согласованность (Catalog + Inventory, Identity + Profile).
+### Каталог ошибок
+
+| Код | HTTP | Когда |
+|---|---|---|
+| `VALIDATION_ERROR` | 400 | нарушение ограничений OpenAPI, битый JSON, нет тела, некорректный UUID |
+| `TOKEN_INVALID` / `TOKEN_EXPIRED` | 401 | нет access token, неверная подпись или тип токена / срок истёк |
+| `REFRESH_TOKEN_INVALID` | 401 | refresh token невалиден или истёк |
+| `INVALID_CREDENTIALS` | 401 | неверный email или пароль |
+| `ACCESS_DENIED` | 403 | роли не разрешена операция; SELLER меняет чужой товар |
+| `ORDER_OWNERSHIP_VIOLATION` | 403 | заказ другого пользователя |
+| `PRODUCT_NOT_FOUND` / `ORDER_NOT_FOUND` | 404 | нет по ID |
+| `PRODUCT_INACTIVE` | 409 | товар в заказе не `ACTIVE` |
+| `ORDER_HAS_ACTIVE` | 409 | у пользователя есть заказ в `CREATED` / `PAYMENT_PENDING` |
+| `INVALID_STATE_TRANSITION` | 409 | недопустимый переход; обновление не в `CREATED` |
+| `INSUFFICIENT_STOCK` | 409 | `details.items`: `product_id`, `requested`, `available` |
+| `USER_ALREADY_EXISTS` / `PROMO_CODE_ALREADY_EXISTS` | 409 | дубликат email / кода |
+| `PROMO_CODE_INVALID` | 422 | `details.reason`: `NOT_FOUND`, `INACTIVE`, `NOT_STARTED`, `EXPIRED`, `EXHAUSTED` |
+| `PROMO_CODE_MIN_AMOUNT` | 422 | сумма ниже `min_order_amount` |
+| `ORDER_LIMIT_EXCEEDED` | 429 | `details.retry_after_seconds` |
 
 ---
 
-## 6. Владение данными
+## 5. Бизнес-логика заказов
 
-**Правило: у каждого сервиса своё хранилище, и никто другой не обращается к нему напрямую.** Разделяемых баз данных нет. Чужие данные сервис получает только через API владельца или через его события. Если сервис хранит локальную копию чужих данных (read-model), он не является их владельцем и не меняет их.
+### Модель состояний
 
-| Сервис | Хранилище | Владеет данными | Read-model (копии чужих данных, только чтение) |
-|---|---|---|---|
-| User Service | User DB (PostgreSQL) | учётные записи, хэши паролей, refresh-токены, роли, профили покупателей, адреса, профили продавцов, статус верификации | — |
-| Catalog Service | Catalog DB (PostgreSQL), Media (S3) | товары, категории, атрибуты, цены, изображения, остатки, резервы под заказ | `seller_id → статус продавца` (из `user.*`) |
-| Feed Service | OpenSearch, Redis | поисковый индекс, профили интересов пользователей, сырые поведенческие события, кэш лент | денормализованные карточки товаров (из `catalog.*`), факты покупок (из `order.*`) |
-| Order Service | Order DB (PostgreSQL) | корзины, заказы, позиции заказа со **снимком** цены и названия, история статусов, outbox | — |
-| Payment Service | Payment DB (PostgreSQL) | платежи, возвраты, проводки ledger (двойная запись), начисленные комиссии, выплаты, реквизиты выплат продавцов, outbox | — |
-| Notification Service | Notification DB (PostgreSQL) | шаблоны, настройки подписок пользователя, журнал отправок и статусы доставки | контакты пользователя: email, телефон, push-токен (из `user.*`) |
-
-Номера карт хранит только PSP. Payment Service работает с токенами провайдера, полные данные карт в маркетплейс не попадают.
-
----
-
-## 7. Взаимодействия сервисов
-
-### 7.1. Синхронные взаимодействия
-
-| Откуда | Куда | Протокол | Зачем | Почему синхронно |
-|---|---|---|---|---|
-| Клиенты | API Gateway | HTTPS / REST | все пользовательские запросы | пользователь ждёт ответа |
-| API Gateway | User / Catalog / Feed / Order / Payment | HTTP / REST | маршрутизация запросов | пользователь ждёт ответа |
-| Order | Catalog | gRPC | получить актуальную цену и зарезервировать остатки при checkout | без резерва нельзя создать заказ, а пользователь должен сразу узнать, если товара нет |
-| Order | Payment | gRPC | создать платёж и получить ссылку на оплату у PSP | ссылку на оплату нужно сразу вернуть клиенту |
-| Payment | PSP | HTTPS | создание платежа, возврат, выплата | API внешнего провайдера синхронное |
-| PSP | Payment | HTTPS webhook | результат платежа | так устроен PSP; обработчик идемпотентен по `payment_id` |
-| Notification | Email / SMS / Push | HTTPS | доставка сообщений | API провайдеров; отправка идёт из асинхронного consumer, поэтому для бизнес-потока она не блокирующая |
-
-### 7.2. Асинхронные взаимодействия (Kafka)
-
-| Издатель | Топик / событие | Подписчики | Реакция |
-|---|---|---|---|
-| User | `user.registered`, `user.updated` | Notification, Catalog | Notification: приветственное письмо, обновление копии контактов. Catalog: обновление статуса продавца. |
-| Catalog | `catalog.product.published / updated / unpublished`, `catalog.stock.changed` | Feed | переиндексация товара, исключение из ленты товаров без остатка |
-| Feed (приём от Gateway) | `feed.events` (view, click, add_to_cart) | Feed | пересчёт профиля интересов |
-| Order | `order.created`, `order.status_changed` | Catalog, Feed, Notification | Catalog: подтверждение резерва (`paid`) или его снятие (`cancelled`). Feed: учёт покупки. Notification: сообщение покупателю и продавцу. |
-| Payment | `payment.succeeded`, `payment.failed`, `payment.refunded` | Order, Notification | Order: переход в `paid` или `cancelled`. Notification: квитанция или сообщение об ошибке. |
-
-Гарантии: события публикуются через **transactional outbox** (запись в БД и событие в outbox делаются одной транзакцией), доставка **at-least-once**, consumers **идемпотентны** (дедупликация по `event_id`). Ключ партиции равен ID агрегата (`order_id`, `product_id`), поэтому события одного агрегата обрабатываются по порядку.
-
-### 7.3. Основной сценарий: оформление и оплата заказа (сага с хореографией)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor B as Покупатель
-    participant GW as API Gateway
-    participant O as Order
-    participant C as Catalog
-    participant P as Payment
-    participant PSP as PSP
-    participant K as Kafka
-    participant N as Notification
-
-    B->>GW: POST /orders (checkout)
-    GW->>O: создать заказ
-    O->>C: Reserve(items) [gRPC]
-    C-->>O: резерв + актуальные цены
-    O->>P: CreatePayment(order_id, amount) [gRPC]
-    P->>PSP: создать платёж
-    PSP-->>P: payment_url
-    P-->>O: payment_url
-    O-->>GW: order_id, payment_url
-    GW-->>B: редирект на оплату
-    O-)K: order.created
-    B->>PSP: оплата
-    PSP->>P: webhook (succeeded)
-    P-)K: payment.succeeded
-    K-)O: payment.succeeded → status = paid
-    O-)K: order.status_changed(paid)
-    K-)C: подтвердить резерв
-    K-)N: уведомить покупателя и продавца
+```
+CREATED → PAYMENT_PENDING → PAID → SHIPPED → COMPLETED
+   ↓             ↓
+CANCELED     CANCELED
 ```
 
-Компенсации: если платёж не прошёл или резерв истёк по таймауту, Order переводит заказ в `cancelled` и публикует `order.status_changed(cancelled)`, после чего Catalog снимает резерв. Если Payment недоступен в момент checkout, Order сразу снимает резерв синхронным вызовом `Release` и возвращает клиенту ошибку.
+Переходы выполняются через `POST /orders/{id}/status` (`{"status": "PAYMENT_PENDING"}`), отмена — через `POST /orders/{id}/cancel`. Запрос на переход в `CANCELED` через `/status` выполняет ту же процедуру отмены. Таблица переходов: `TRANSITIONS` в `services/orders.py`.
+
+### Транзакции и блокировки
+
+Каждый запрос выполняется в одной транзакции (`app.db.transaction`): при любой ошибке откатывается всё, включая резерв остатков и `current_uses`. От гонок защищают блокировки `SELECT … FOR UPDATE`:
+
+- строка пользователя: два параллельных `POST /orders` одного пользователя выполняются по очереди, поэтому не обходят лимит частоты и проверку активного заказа;
+- строки товаров блокируются в порядке `id`, поэтому параллельные заказы не взаимоблокируются и не уводят остаток в минус (дополнительно есть `CHECK (stock >= 0)`);
+- строка промокода: `current_uses` не превысит `max_uses` (дополнительно есть `CHECK`).
+
+### Принятые трактовки
+
+- **PERCENTAGE больше 70%.** Условие «не более 70% от `total_amount`, в ином случае цена 100%» прочитано так: если `discount_value > 70`, скидка равна 0 и заказ оплачивается полностью. Промокод при этом считается применённым (`current_uses` увеличивается), как описано в алгоритме.
+- **Пересчёт при `PUT /orders/{id}`.** Промокод снимается, если сумма стала ниже `min_order_amount` или промокод стал неактивным / истёк. Проверка `current_uses < max_uses` при пересчёте не выполняется: использование этим заказом уже учтено.
+- **Лимит частоты при обновлении** считается по пользователю, который выполняет запрос (для ADMIN это сам ADMIN).
+- **Повторяющийся `product_id`** в `items` допустим. Остаток проверяется по суммарному количеству.
+- **Регистрация** доступна с ролями `USER` и `SELLER`. `ADMIN` создаётся только из переменных окружения.
+- **Деньги** в API передаются как `number` (`format: decimal`), в БД хранятся как `NUMERIC(12,2)`, считаются в `Decimal` и округляются до копеек (ROUND_HALF_UP). Сумма заказа больше 9 999 999 999.99 (предел колонки) отклоняется с `VALIDATION_ERROR`.
+- **Даты без часового пояса** в `valid_from` / `valid_until` считаются UTC.
 
 ---
 
-## 8. Альтернативные варианты декомпозиции
+## 6. Демонстрация
 
-### Вариант A. Модульный монолит
+```bash
+BASE=http://localhost:8080
+json() { python3 -c "import sys,json; print(json.load(sys.stdin)$1)"; }
 
-Один деплоймент и одна кодовая база, внутри модули по тем же доменам: `users`, `catalog`, `feed`, `orders`, `payments`, `notifications`. Одна СУБД PostgreSQL, у каждого модуля своя схема. Модули общаются через внутренние интерфейсы и in-process шину событий. Поиск по-прежнему вынесен в OpenSearch.
+# продавец и покупатель
+curl -s -X POST $BASE/auth/register -H 'Content-Type: application/json' -d '{"email":"seller@demo.io","password":"password123","role":"SELLER"}'
+curl -s -X POST $BASE/auth/register -H 'Content-Type: application/json' -d '{"email":"buyer@demo.io","password":"password123"}'
+SELLER=$(curl -s -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{"email":"seller@demo.io","password":"password123"}' | json "['access_token']")
+BUYER=$(curl -s -X POST $BASE/auth/login -H 'Content-Type: application/json' -d '{"email":"buyer@demo.io","password":"password123"}' | json "['access_token']")
 
-### Вариант B. Микросервисы по bounded context (выбран)
+# товар и промокод
+PID=$(curl -s -X POST $BASE/products -H "Authorization: Bearer $SELLER" -H 'Content-Type: application/json' \
+  -d '{"name":"Phone","price":100.00,"stock":10,"category":"electronics","status":"ACTIVE"}' | json "['id']")
+curl -s -X POST $BASE/promo-codes -H "Authorization: Bearer $SELLER" -H 'Content-Type: application/json' \
+  -d '{"code":"SALE_10","discount_type":"PERCENTAGE","discount_value":10,"max_uses":100,"valid_from":"2026-01-01T00:00:00Z","valid_until":"2027-01-01T00:00:00Z"}'
 
-Шесть доменных сервисов и API Gateway, описанные выше. У каждого сервиса своя БД. Синхронно сервисы вызывают друг друга только там, где пользователь ждёт ответа; всё остальное идёт через события в Kafka.
+# заказ
+OID=$(curl -s -X POST $BASE/orders -H "Authorization: Bearer $BUYER" -H 'Content-Type: application/json' \
+  -d "{\"items\":[{\"product_id\":\"$PID\",\"quantity\":2}],\"promo_code\":\"SALE_10\"}" | tee /dev/stderr | json "['id']")
 
-### Вариант C. Крупные сервисы по контурам нагрузки и критичности
+# список, обновление, отмена
+curl -s "$BASE/products?page=0&size=20&status=ACTIVE&category=electronics" -H "Authorization: Bearer $BUYER"
+curl -s -X PUT $BASE/orders/$OID -H "Authorization: Bearer $BUYER" -H 'Content-Type: application/json' -d "{\"items\":[{\"product_id\":\"$PID\",\"quantity\":1}]}"
+curl -s -X POST $BASE/orders/$OID/cancel -H "Authorization: Bearer $BUYER"
+```
 
-Три сервиса:
+Содержимое таблиц:
 
-1. **Commerce Core**: пользователи, каталог, остатки и заказы, одна БД.
-2. **Payments**: платежи и учёт, отдельная БД.
-3. **Engagement**: лента, поиск и уведомления; OpenSearch, Redis и своя БД.
+```bash
+make psql     # = docker compose exec postgres psql -U marketplace -d marketplace
+```
 
-Транзакционное ядро здесь монолитное, отдельно вынесены только финансы и контур, где важнее всего производительность чтения.
+```sql
+SELECT id, name, price, stock, status, seller_id, created_at, updated_at FROM products ORDER BY created_at DESC LIMIT 10;
+SELECT id, user_id, status, promo_code_id, total_amount, discount_amount, created_at, updated_at FROM orders ORDER BY created_at DESC;
+SELECT order_id, product_id, quantity, price_at_order FROM order_items;
+SELECT code, discount_type, discount_value, min_order_amount, max_uses, current_uses, active FROM promo_codes;
+SELECT user_id, operation_type, created_at FROM user_operations ORDER BY created_at DESC;
+SELECT id, email, role FROM users;
+SELECT version, description, success FROM flyway_schema_history;
+\d products        -- индекс idx_products_status и триггер products_set_updated_at
+```
 
----
-
-## 9. Trade-off'ы вариантов
-
-### Вариант A. Модульный монолит
-
-| Плюсы | Минусы |
-|---|---|
-| Резерв остатков, создание заказа и смена статуса делаются одной ACID-транзакцией, сага и компенсации не нужны. | Масштабировать можно только всё приложение целиком. Ради нагрузки на ленту приходится масштабировать и платежи. |
-| Минимум инфраструктуры: один деплой, одна БД, брокер не обязателен. | Общий процесс: утечка памяти или тяжёлый запрос ленты могут уронить checkout и обработку webhook от PSP. |
-| Межмодульные вызовы идут без сетевых задержек и сетевых отказов. | Финансовые данные лежат в одной БД с остальными, поэтому изолировать доступ и аудит сложнее: границу держит только дисциплина схем. |
-| Рефакторинг границ модулей дешёвый, всё в одном репозитории. | Все релизы общие: изменение ранжирования ленты требует релиза вместе с платёжным кодом. |
-| Удобно, когда команда небольшая, а домены ещё меняются. | Границы модулей со временем размываются (прямые JOIN между схемами), и потом выделить сервисы становится дорого. |
-
-### Вариант B. Микросервисы по bounded context
-
-| Плюсы | Минусы |
-|---|---|
-| Сервисы масштабируются независимо: Feed по чтению, Notification по всплескам, Order и Payment по транзакциям. | Распределённые транзакции: checkout требует саги, компенсаций, outbox и идемпотентности, а это сложнее, чем одна транзакция. |
-| Отказы изолированы: если упал Feed или Notification, заказы всё равно оформляются и оплачиваются. | Согласованность итоговая: Feed и Notification видят изменения с задержкой. |
-| Финансовый контур отделён: своя БД, свои доступы, свой цикл релизов и аудита. | Дорогая эксплуатация: 7 деплойментов, Kafka, распределённая трассировка, контрактные тесты. |
-| Каждому домену подходящее хранилище: PostgreSQL для транзакций, OpenSearch и Redis для ленты. | Сетевые задержки и отказы на синхронном пути checkout (Order → Catalog → Payment): нужны таймауты, ретраи, circuit breaker. |
-| Команды работают и релизятся независимо, контракты зафиксированы явно. | Ошибку в границах исправить дорого: перенос данных между сервисами означает миграцию. |
-
-### Вариант C. Крупные сервисы по контурам
-
-| Плюсы | Минусы |
-|---|---|
-| Резерв и создание заказа остаются локальной ACID-транзакцией внутри Commerce Core. | Commerce Core вырастает в мини-монолит с тремя доменами: общий релизный цикл и риск размытия границ. |
-| Финансы изолированы так же, как в варианте B. | Лента и уведомления живут в одном сервисе, хотя у них разные профили нагрузки и отказов: всплеск рассылок бьёт по латентности ленты. |
-| Инфраструктуры и сетевых вызовов меньше, чем в B: 3 сервиса вместо 6. | Каталог (нагрузка от продавцов, загрузка медиа) масштабируется только вместе с заказами и пользователями. |
-| Хороший промежуточный шаг между A и B. | Командам, которые делят Commerce Core, сложно владеть им независимо. |
-
-### Сводное сравнение
-
-| Критерий | A. Монолит | B. Микросервисы | C. Контуры |
-|---|---|---|---|
-| Согласованность checkout | ACID | Сага (итоговая) | ACID в ядре, сага с Payments |
-| Независимое масштабирование | нет | полное | частичное |
-| Изоляция отказов ленты и уведомлений от заказов | нет | да | частично (лента и уведомления зависят друг от друга) |
-| Изоляция финансовых данных | слабая | сильная | сильная |
-| Стоимость эксплуатации | низкая | высокая | средняя |
-| Независимые релизы команд | нет | да | частично |
+Логи запросов: `docker compose logs -f app`.
 
 ---
 
-## 10. Финальный выбор и обоснование
+## 7. Внешние зависимости
 
-**Выбран вариант B: микросервисы по bounded context.**
-
-Обоснование опирается на требования кейса:
-
-1. **У требований разные профили нагрузки.** Персонализированная лента нагружена в основном чтением и требует специализированных хранилищ (поисковый индекс, кэш профилей). Оформление заказов и платежи нагружены транзакционной записью и требуют строгой согласованности. Уведомления асинхронные и зависят от внешних провайдеров. В варианте A эти три профиля делят один процесс и одну БД. В варианте C лента и уведомления оказываются в одном сервисе.
-2. **Ошибки в платежах обходятся дорого.** Учёт платежей требует неизменяемого ledger, аудита и ограниченного доступа. Отдельный Payment Service со своей БД даёт эту границу физически, а не только на уровне соглашений.
-3. **Отказ второстепенных функций не должен останавливать продажи.** Если Feed или Notification недоступны, покупатель всё равно может оформить и оплатить заказ. В B это обеспечивает архитектура: эти сервисы получают события асинхронно и не стоят на синхронном пути checkout.
-4. **Перечень функций в кейсе почти совпадает с bounded context'ами.** Шесть требуемых возможностей ложатся на шесть сервисов. Объединения сделаны только там, где нужна общая транзакция (Catalog + Inventory, Identity + Profile). Поэтому сервисов ровно столько, сколько нужно, без лишнего дробления (отдельные Cart, Inventory, Auth не выделены).
-5. **Главный минус B, распределённую согласованность checkout, можно контролировать.** На синхронном пути всего два межсервисных вызова (резерв и создание платежа), остальное сделано сагой с хореографией, outbox и идемпотентными consumers. Это известные шаблоны с понятной стоимостью.
-
-**Допущения, при которых выбор верен:**
-
-- над продуктом работает больше одной команды, и каждая отвечает за свои домены;
-- нагрузка на ленту заметно выше нагрузки на оформление заказов (типичная воронка e-commerce; конкретных цифр в кейсе нет);
-- есть платформенная поддержка: контейнерная оркестрация, Kafka, централизованные логи и трассировка.
-
-**Когда выбор стоит пересмотреть:** если команда одна и продукт на стадии MVP, разумнее начать с варианта A и сразу соблюдать границы модулей и владение схемами из раздела 6. Тогда переход к B сведётся к выносу модулей в отдельные сервисы без перепроектирования доменов.
-
----
-
-## 11. Реализованный сервис
-
-`catalog-service`: каркас Catalog Service на Python 3.12 + FastAPI.
-
-| Endpoint | Метод | Ответ |
+| Зависимость | Версия | Назначение |
 |---|---|---|
-| `/health` | GET | `200 OK`, `{"status":"ok","service":"catalog-service","version":"0.1.0"}` |
-| `/docs` | GET | Swagger UI (генерируется FastAPI) |
+| `fastapi` | 0.115.6 | HTTP-фреймворк, его используют сгенерированные роутеры |
+| `uvicorn` | 0.34.0 | ASGI-сервер |
+| `pydantic` | 2.10.4 | сгенерированные модели и валидация |
+| `SQLAlchemy` | 2.0.36 | ORM, асинхронные сессии |
+| `asyncpg` | 0.30.0 | драйвер PostgreSQL |
+| `PyJWT` | 2.10.1 | подпись и проверка JWT (HS256) |
+| `openapitools/openapi-generator-cli` | v7.10.0 | образ генератора (только сборка) |
+| `flyway/flyway` | 10.20.1 | образ для миграций |
+| `postgres` | 16.4-alpine | БД |
 
-В образе настроен `HEALTHCHECK`, который раз в 10 с опрашивает `/health`. Процесс запускается от непривилегированного пользователя `appuser`.
+Пароли хешируются PBKDF2-SHA256 (200 000 итераций) из стандартной библиотеки, отдельная зависимость не нужна.

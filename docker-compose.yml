@@ -1,11 +1,55 @@
 services:
-  catalog-service:
-    build:
-      context: ./services/catalog-service
-    image: marketplace/catalog-service:0.1.0
-    container_name: catalog-service
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: marketplace-postgres
     environment:
-      SERVICE_VERSION: "0.1.0"
+      POSTGRES_DB: marketplace
+      POSTGRES_USER: marketplace
+      POSTGRES_PASSWORD: marketplace
     ports:
-      - "8000:8000"
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketplace -d marketplace"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  flyway:
+    image: flyway/flyway:10.20.1
+    container_name: marketplace-flyway
+    command: >
+      -url=jdbc:postgresql://postgres:5432/marketplace
+      -user=marketplace
+      -password=marketplace
+      -locations=filesystem:/flyway/sql
+      -connectRetries=10
+      migrate
+    volumes:
+      - ./db/migrations:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: .
+    image: marketplace/api:1.0.0
+    container_name: marketplace-api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://marketplace:marketplace@postgres:5432/marketplace
+      JWT_SECRET: change-me-in-production-please-32b
+      ACCESS_TOKEN_TTL_MINUTES: "15"
+      REFRESH_TOKEN_TTL_DAYS: "7"
+      ORDER_RATE_LIMIT_MINUTES: "1"
+      ADMIN_EMAIL: admin@marketplace.local
+      ADMIN_PASSWORD: admin12345
+    ports:
+      - "8080:8080"
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+volumes:
+  pgdata:
