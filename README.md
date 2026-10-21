@@ -29,7 +29,7 @@ docker compose up --build          # postgres → flyway migrate → app
 | PostgreSQL | `localhost:5433`, БД / пользователь / пароль: `marketplace` |
 | Администратор | `admin@marketplace.local` / `admin12345` |
 
-E2E-проверка всех сценариев (76 проверок, нужен только Python 3 из стандартной поставки):
+E2E-проверка всех сценариев (78 проверок, нужен только Python 3 из стандартной поставки):
 
 ```bash
 python3 tests/e2e.py
@@ -112,7 +112,7 @@ make generate     # = docker run openapitools/openapi-generator-cli:v7.10.0 ... 
 | 5 | Единый формат `Error {error_code, message, details}`, каталог кодов в `ErrorCode` | `openapi.yaml`, `app/errors.py` |
 | 6 | Ограничения в OpenAPI (`minLength`, `maximum`, `minItems`, `pattern`…), `VALIDATION_ERROR` с полями в `details.fields` | сгенерированные модели + обработчик `RequestValidationError` |
 | 7 | Создание / обновление / отмена заказа, машина состояний, промокоды, всё в одной транзакции | `services/orders.py`, `services/promo_codes.py` |
-| 8 | JSON-лог каждого запроса: `request_id`, `method`, `endpoint`, `status_code`, `duration_ms`, `user_id`, `timestamp`, тело мутирующих запросов с маской паролей; `X-Request-Id` в ответе | `app/request_logging.py` |
+| 8 | JSON-лог каждого запроса: `request_id`, `method`, `endpoint`, `status_code`, `duration_ms`, `user_id`, `timestamp`, тело мутирующих запросов с маской паролей; `X-Request-Id` в каждом ответе, включая 500 `INTERNAL_ERROR` | `app/request_logging.py` |
 | 9 | `/auth/register`, `/auth/login`, `/auth/refresh`; access 15 мин, refresh 7 дней; `TOKEN_EXPIRED` / `TOKEN_INVALID` / `REFRESH_TOKEN_INVALID` | `app/security.py`, `services/auth.py` |
 | 10 | Роли `USER` / `SELLER` / `ADMIN` в claim `role`, `seller_id` у товара, `ACCESS_DENIED`, матрица доступа в описании спецификации | `require_role`, `_check_can_manage`, `_check_owner` |
 
@@ -120,7 +120,7 @@ make generate     # = docker run openapitools/openapi-generator-cli:v7.10.0 ... 
 
 | Код | HTTP | Когда |
 |---|---|---|
-| `VALIDATION_ERROR` | 400 | нарушение ограничений OpenAPI, битый JSON, нет тела, некорректный UUID |
+| `VALIDATION_ERROR` | 400 | нарушение ограничений OpenAPI (включая границы int32), битый JSON, нет тела, некорректный UUID, ограничения между полями промокода |
 | `TOKEN_INVALID` / `TOKEN_EXPIRED` | 401 | нет access token, неверная подпись или тип токена / срок истёк |
 | `REFRESH_TOKEN_INVALID` | 401 | refresh token невалиден или истёк |
 | `INVALID_CREDENTIALS` | 401 | неверный email или пароль |

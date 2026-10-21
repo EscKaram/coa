@@ -1,6 +1,5 @@
 """Единый формат ошибок API (схема Error в OpenAPI) и обработчики исключений."""
 
-import logging
 import re
 from typing import Any
 
@@ -11,8 +10,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from marketplace_api.models.error import Error
 from marketplace_api.models.error_code import ErrorCode
-
-logger = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
@@ -29,6 +26,8 @@ class ApiError(Exception):
 
 
 def validation_error(message: str, fields: list[dict[str, Any]]) -> ApiError:
+    """Ошибка валидации тела запроса, которую нельзя выразить в OpenAPI (ограничения между полями)."""
+    fields = [{"location": "body", "type": "value_error", **f} for f in fields]
     return ApiError(400, ErrorCode.VALIDATION_ERROR, message, {"fields": fields})
 
 
@@ -88,13 +87,7 @@ async def _handle_http_error(_: Request, exc: StarletteHTTPException) -> JSONRes
     return error_response(exc.status_code, ErrorCode.INTERNAL_ERROR, str(exc.detail))
 
 
-async def _handle_unexpected(_: Request, exc: Exception) -> JSONResponse:
-    logger.exception("unhandled error", exc_info=exc)
-    return error_response(500, ErrorCode.INTERNAL_ERROR, "Internal server error")
-
-
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ApiError, _handle_api_error)
     app.add_exception_handler(RequestValidationError, _handle_validation_error)
     app.add_exception_handler(StarletteHTTPException, _handle_http_error)
-    app.add_exception_handler(Exception, _handle_unexpected)

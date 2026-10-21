@@ -137,6 +137,8 @@ def main():
     check("product validation", 400, body, 400, "VALIDATION_ERROR")
     fields = {f["field"] for f in body["details"]["fields"]}
     assert {"name", "price", "stock", "category", "status"} <= fields, fields
+    check("stock above int32", *call("POST", "/products", {"name": "x", "price": 1, "stock": 3_000_000_000, "category": "c", "status": "ACTIVE"}, seller)[:2], 400, "VALIDATION_ERROR")
+    check("page above int32", *call("GET", "/products?page=10000000000000000000", token=user)[:2], 400, "VALIDATION_ERROR")
     check("malformed json", *call("POST", "/products", raw=b"{oops", token=seller)[:2], 400, "VALIDATION_ERROR")
     check("missing body", *call("POST", "/products", raw=b"", token=seller)[:2], 400, "VALIDATION_ERROR")
 

@@ -10,6 +10,9 @@ from typing import Any
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.errors import error_response
+from marketplace_api.models.error_code import ErrorCode
+
 logger = logging.getLogger("api.request")
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
@@ -95,15 +98,24 @@ class RequestLoggingMiddleware:
                     body.extend(chunk)
             return message
 
+        response_started = False
+
         async def send_wrapper(message: Message) -> None:
-            nonlocal status_code
+            nonlocal status_code, response_started
             if message["type"] == "http.response.start":
+                response_started = True
                 status_code = message["status"]
                 MutableHeaders(scope=message).append("X-Request-Id", request_id)
             await send(message)
 
         try:
             await self.app(scope, receive_wrapper, send_wrapper)
+        except Exception:
+            logger.exception("unhandled error, request_id=%s", request_id)
+            if response_started:
+                raise
+            response = error_response(500, ErrorCode.INTERNAL_ERROR, "Internal server error")
+            await response(scope, receive_wrapper, send_wrapper)
         finally:
             record: dict[str, Any] = {
                 "timestamp": timestamp.isoformat(),
