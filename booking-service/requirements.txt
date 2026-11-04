@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
+SQLAlchemy==2.0.36
+asyncpg==0.30.0
+grpcio==1.68.1
+protobuf==5.29.3
+googleapis-common-protos==1.66.0

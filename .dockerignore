@@ -1,6 +1,8 @@
 .git
 .venv
-generated
+**/generated
 **/__pycache__
 **/*.pyc
 docs
+tests
+README.md

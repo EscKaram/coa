@@ -1,55 +1,170 @@
-services:
-  postgres:
-    image: postgres:16.4-alpine
-    container_name: marketplace-postgres
-    environment:
-      POSTGRES_DB: marketplace
-      POSTGRES_USER: marketplace
-      POSTGRES_PASSWORD: marketplace
-    ports:
-      - "5433:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U marketplace -d marketplace"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+name: flight-booking
 
-  flyway:
-    image: flyway/flyway:10.20.1
-    container_name: marketplace-flyway
-    command: >
-      -url=jdbc:postgresql://postgres:5432/marketplace
-      -user=marketplace
-      -password=marketplace
-      -locations=filesystem:/flyway/sql
-      -connectRetries=10
-      migrate
+# API-ключ межсервисных вызовов. Значение по умолчанию — только для локального запуска;
+# переопределяется переменной окружения или файлом .env: FLIGHT_SERVICE_API_KEY=... docker compose up
+x-api-key: &api-key ${FLIGHT_SERVICE_API_KEY:-dev-booking-to-flight-key-change-me}
+
+x-postgres-healthcheck: &postgres-healthcheck
+  interval: 2s
+  timeout: 3s
+  retries: 30
+
+x-redis: &redis
+  image: redis:7.4.1-alpine
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+x-sentinel: &sentinel
+  image: redis:7.4.1-alpine
+  command: sh -c 'cp /etc/redis/sentinel.conf /data/sentinel.conf && exec redis-sentinel /data/sentinel.conf'
+  volumes:
+    - ./redis/sentinel.conf:/etc/redis/sentinel.conf:ro
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+  depends_on:
+    redis-master:
+      condition: service_healthy
+    redis-replica:
+      condition: service_healthy
+
+services:
+  # ---------- Booking Service: PostgreSQL + миграции ----------
+  booking-db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: bookings
+      POSTGRES_USER: bookings
+      POSTGRES_PASSWORD: bookings
+    ports:
+      - "5434:5432"
     volumes:
-      - ./db/migrations:/flyway/sql:ro
+      - booking-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+      test: ["CMD-SHELL", "pg_isready -U bookings -d bookings"]
+
+  booking-migrations:
+    image: flyway/flyway:10.20.1
+    command: >
+      -url=jdbc:postgresql://booking-db:5432/bookings -user=bookings -password=bookings
+      -locations=filesystem:/flyway/sql -connectRetries=10 migrate
+    volumes:
+      - ./booking-service/migrations:/flyway/sql:ro
     depends_on:
-      postgres:
+      booking-db:
         condition: service_healthy
 
-  app:
-    build: .
-    image: marketplace/api:1.0.0
-    container_name: marketplace-api
+  # ---------- Flight Service: PostgreSQL + миграции ----------
+  flight-db:
+    image: postgres:16.4-alpine
     environment:
-      DATABASE_URL: postgresql+asyncpg://marketplace:marketplace@postgres:5432/marketplace
-      JWT_SECRET: change-me-in-production-please-32b
-      ACCESS_TOKEN_TTL_MINUTES: "15"
-      REFRESH_TOKEN_TTL_DAYS: "7"
-      ORDER_RATE_LIMIT_MINUTES: "1"
-      ADMIN_EMAIL: admin@marketplace.local
-      ADMIN_PASSWORD: admin12345
+      POSTGRES_DB: flights
+      POSTGRES_USER: flights
+      POSTGRES_PASSWORD: flights
+    ports:
+      - "5435:5432"
+    volumes:
+      - flight-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      <<: *postgres-healthcheck
+      test: ["CMD-SHELL", "pg_isready -U flights -d flights"]
+
+  flight-migrations:
+    image: flyway/flyway:10.20.1
+    command: >
+      -url=jdbc:postgresql://flight-db:5432/flights -user=flights -password=flights
+      -locations=filesystem:/flyway/sql -connectRetries=10 migrate
+    volumes:
+      - ./flight-service/migrations:/flyway/sql:ro
+    depends_on:
+      flight-db:
+        condition: service_healthy
+
+  # ---------- Redis Sentinel: мастер + реплика + 3 sentinel (кворум 2) ----------
+  # Кеш не хранится на диске (--save "" --appendonly no): после перезапуска он просто пуст.
+  # replica-announce-ip: узлы анонсируют себя именами контейнеров, и Sentinel отдаёт клиентам имя, а не IP.
+  redis-master:
+    <<: *redis
+    command: >
+      redis-server --port 6379 --save "" --appendonly no
+      --maxmemory 128mb --maxmemory-policy volatile-lru
+      --replica-announce-ip redis-master
+
+  redis-replica:
+    <<: *redis
+    command: >
+      redis-server --port 6379 --save "" --appendonly no
+      --maxmemory 128mb --maxmemory-policy volatile-lru
+      --replicaof redis-master 6379
+      --replica-announce-ip redis-replica
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  redis-sentinel-1:
+    <<: *sentinel
+
+  redis-sentinel-2:
+    <<: *sentinel
+
+  redis-sentinel-3:
+    <<: *sentinel
+
+  # ---------- Сервисы ----------
+  flight-service:
+    build:
+      context: .
+      dockerfile: flight-service/Dockerfile
+    image: flight-booking/flight-service:1.0.0
+    environment:
+      DATABASE_URL: postgresql+asyncpg://flights:flights@flight-db:5432/flights
+      FLIGHT_SERVICE_API_KEYS: *api-key
+      REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      REDIS_MASTER_NAME: mymaster
+      REDIS_SOCKET_TIMEOUT_MS: "300"
+      CACHE_TTL_SECONDS: "300"
+    ports:
+      - "50051:50051"
+    depends_on:
+      flight-migrations:
+        condition: service_completed_successfully
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
+
+  booking-service:
+    build:
+      context: .
+      dockerfile: booking-service/Dockerfile
+    image: flight-booking/booking-service:1.0.0
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bookings:bookings@booking-db:5432/bookings
+      FLIGHT_SERVICE_ADDR: flight-service:50051
+      FLIGHT_SERVICE_API_KEY: *api-key
+      FLIGHT_RPC_TIMEOUT_MS: "2000"
+      RETRY_MAX_ATTEMPTS: "3"
+      RETRY_INITIAL_BACKOFF_MS: "100"
+      RETRY_BACKOFF_MULTIPLIER: "2"
+      CB_FAILURE_THRESHOLD: "5"
+      CB_WINDOW_SECONDS: "30"
+      CB_OPEN_TIMEOUT_SECONDS: "15"
     ports:
       - "8080:8080"
     depends_on:
-      flyway:
+      booking-migrations:
         condition: service_completed_successfully
-    restart: unless-stopped
+      flight-service:
+        condition: service_healthy
 
 volumes:
-  pgdata:
+  booking-pgdata:
+  flight-pgdata:

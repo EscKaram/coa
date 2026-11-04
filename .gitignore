@@ -5,5 +5,5 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# Код, сгенерированный из openapi/openapi.yaml (make generate / docker build)
+# Код, сгенерированный из proto/ (make proto / docker build)
 generated/
