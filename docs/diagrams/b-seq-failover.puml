@@ -1,0 +1,61 @@
+@startuml b-seq-failover
+title Вариант 2 (Temporal). Failover: push не подтверждён → SMS (провайдер A отказал → B), позднее подтверждение push
+autonumber
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign left
+
+participant "Temporal\nServer" as T
+participant "Delivery Workflow\nWorker" as WW
+participant "SMS Activity\nWorker" as SW
+participant "SMS-провайдер A" as SA
+participant "SMS-провайдер B" as SB
+participant "Receipt Collector\n+ Signaler" as RC
+actor "Приложение" as APP
+queue "Kafka" as K
+
+== Push передан провайдеру, таймер 10 с запущен ==
+note over APP : устройство вне сети\nили приложение выгружено ОС
+... 10 с без сигнала ...
+
+== Таймаут push: следующий шаг плана ==
+T -> WW : workflow task (TimerFired)
+WW -> WW : delivered_by is None → шаг 2 (SMS)
+WW --> T : ScheduleActivity send(attempt #2)\ntask queue = sms, retry policy: 3 попытки, backoff 1 с
+T -> SW : activity send(attempt #2)
+
+== Отказ провайдера A внутри activity ==
+SW -> SA : send(client_ref = attempt #2)
+SA --> SW : 503
+SW -> SW : circuit breaker A → OPEN\n(ошибка однозначная: дубля нет)
+SW -> SB : send(client_ref = attempt #2)
+SB --> SW : 202 Accepted (provider_message_id)
+SW --> T : completed(provider = B)
+T -> WW : workflow task
+WW --> T : StartTimer(60 с), wait_condition(delivered_by)
+
+== Доставка по SMS ==
+SB -> RC : DLR DELIVERED (client_ref = attempt #2)
+RC -> K : ntf.receipts
+K -> RC : Receipt (Signaler)
+RC -> T : SignalWorkflow(receipt(attempt #2, DELIVERED))
+T -> WW : workflow task (signal)
+WW --> T : CancelTimer; publish_status;\nCompleteWorkflow(DELIVERED via sms)
+
+== Позднее подтверждение push ==
+APP -> RC : POST /v1/acks {attempt #1}
+RC -> K : ntf.receipts
+K -> RC : Receipt (Signaler)
+RC -> T : SignalWorkflow(receipt(attempt #1))
+T --> RC : NotFound: workflow execution already completed
+RC -> K : ntf.status: late ack (push)
+RC -> RC : ntf_late_ack_total{channel=push} += 1
+
+== Альтернатива: ack по push пришёл, когда activity SMS ещё не взята воркером ==
+alt activity send(attempt #2) в task queue, не начата
+  RC -> T : SignalWorkflow(receipt(attempt #1, DELIVERED))
+  T -> WW : workflow task (signal)
+  WW --> T : RequestCancelActivity(send #2)
+  T -> T : activity отменена до старта:\nSMS не отправляется
+  WW --> T : publish_status; CompleteWorkflow(DELIVERED via push)
+end
+@enduml

@@ -1,0 +1,55 @@
+@startuml b-seq-main
+title Вариант 2 (Temporal). Основной сценарий: транзакционное уведомление доставлено по push
+autonumber
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign left
+
+participant "Сервис переводов\n(+ outbox)" as P
+queue "Kafka" as K
+participant "Workflow\nStarter" as ST
+participant "Temporal\nServer" as T
+participant "Delivery Workflow\nWorker" as WW
+participant "Push Activity\nWorker" as PW
+participant "APNs / FCM" as APNS
+actor "Приложение\nклиента" as APP
+participant "Receipt Collector\n+ Signaler" as RC
+
+== Запуск workflow (дедупликация по WorkflowID) ==
+P -> K : ntf.tx.requests (outbox продюсера)
+K -> ST : NotificationRequested
+ST -> ST : notification_id = UUIDv5(producer, idempotency_key)
+ST -> T : StartWorkflow(TxDeliveryWorkflow, id = notification_id,\n  USE_EXISTING / REJECT_DUPLICATE)
+T --> ST : started\n(или already started → повтор продюсера, отправки нет)
+ST -> K : commit offset
+
+== План каналов ==
+T -> WW : workflow task
+WW --> T : ScheduleActivity build_plan
+T -> WW : activity build_plan
+WW -> WW : настройки из Redis, шаблон;\nплан: push (T = 10 с) → SMS (T = 60 с) → email
+WW --> T : completed(plan)
+
+== Попытка #1: push ==
+T -> WW : workflow task
+WW --> T : ScheduleActivity send(attempt #1)\ntask queue = push
+T -> PW : activity send(attempt #1)
+PW -> APNS : send(apns-collapse-id = notification_id)
+APNS --> PW : 200 OK
+PW --> T : completed
+T -> WW : workflow task
+WW --> T : StartTimer(10 с), wait_condition(delivered_by)
+
+== Подтверждение сигналом ==
+APNS -> APP : push
+APP -> RC : POST /v1/acks {notification_id, attempt_id}
+RC -> K : ntf.receipts
+K -> RC : Receipt (Signaler)
+RC -> T : SignalWorkflow(notification_id,\n  receipt(attempt #1, DELIVERED))
+T -> WW : workflow task (signal)
+WW -> WW : delivered_by = attempt #1
+WW --> T : CancelTimer; ScheduleActivity publish_status
+T -> WW : activity publish_status
+WW -> K : ntf.status: DELIVERED via push
+WW --> T : CompleteWorkflow(DELIVERED via push)
+note over T : история workflow видна в Temporal Web UI\n(поддержка, разбор инцидентов)
+@enduml

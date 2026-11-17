@@ -1,0 +1,54 @@
+@startuml state-machine
+title Автомат состояний транзакционного уведомления и попытки доставки
+
+skinparam state {
+  BackgroundColor<<terminal>> #E8F5E9
+  BackgroundColor<<fail>> #FFEBEE
+}
+
+state "Уведомление (notification.state)" as N {
+  state "ACCEPTED" as N_ACC
+  state "DISPATCHING\nstep = k" as N_DISP
+  state "DELIVERED\ndelivered_via = канал" as N_DEL <<terminal>>
+  state "UNDELIVERED\n+ инцидент поддержки" as N_UND <<fail>>
+
+  [*] --> N_ACC : запрос принят\n(дедупликация по notification_id)
+  N_ACC --> N_DISP : план каналов построен,\nсоздана попытка #1
+  N_DISP --> N_DISP : попытка k → FAILED или TIMED_OUT\n/ создана попытка k+1\n(в той же транзакции, CAS по version)
+  N_DISP --> N_DEL : подтверждение по любой попытке
+  N_DISP --> N_UND : план исчерпан\nили истёк TTL 24 ч
+  N_DEL --> [*]
+  N_UND --> [*]
+}
+
+state "Попытка (delivery_attempt.state)" as A {
+  state "QUEUED\nкоманда в outbox" as A_Q
+  state "SUBMITTED\nпровайдер принял" as A_S
+  state "DELIVERED" as A_D <<terminal>>
+  state "FAILED" as A_F <<fail>>
+  state "TIMED_OUT" as A_T <<fail>>
+  state "CANCELLED" as A_C
+
+  [*] --> A_Q
+  A_Q --> A_S : AttemptSubmitted
+  A_Q --> A_D : подтверждение пришло\nраньше AttemptSubmitted
+  A_Q --> A_F : нет контакта / токена,\nотказ всех провайдеров
+  A_Q --> A_T : дедлайн истёк в очереди\n(sender недоступен)
+  A_Q --> A_C : уведомление доставлено\nдругим каналом
+  A_S --> A_D : ack / DLR DELIVERED /\nemail delivered
+  A_S --> A_F : DLR UNDELIVERABLE,\nhard bounce, токен отозван
+  A_S --> A_T : нет подтверждения за T_канала
+  A_T --> A_T : позднее подтверждение:\nlate_delivered_at, ntf_late_ack_total
+  A_D --> [*]
+  A_F --> [*]
+  A_C --> [*]
+}
+
+note bottom of A
+  Инварианты:
+  1. Не более одной активной попытки (QUEUED или SUBMITTED) на уведомление.
+  2. Попытка k+1 создаётся только вместе с закрытием попытки k.
+  3. Из DELIVERED и UNDELIVERED уведомления переходов нет.
+  4. Повторное событие — no-op (условия WHERE state IN (...)).
+end note
+@enduml

@@ -1,0 +1,59 @@
+@startuml a-seq-main
+title Вариант 1. Основной сценарий: транзакционное уведомление доставлено по push
+autonumber
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign left
+
+participant "Сервис переводов\n(+ outbox)" as P
+queue "Kafka" as K
+participant "Delivery\nOrchestrator" as O
+database "Redis\n(кеш настроек)" as R
+database "Delivery DB\n(PostgreSQL)" as DB
+participant "Outbox Relay\n(Debezium)" as OR
+participant "Push Sender" as PS
+participant "APNs / FCM" as APNS
+actor "Приложение\nклиента" as APP
+participant "Receipt\nCollector" as RC
+
+== Продюсер: событие не теряется ==
+P -> P : BEGIN; списание;\nINSERT outbox(NotificationRequested,\n  idempotency_key = transfer_id); COMMIT
+P -> K : ntf.tx.requests (relay продюсера)
+
+== Оркестратор: дедупликация, план, первая попытка ==
+K -> O : NotificationRequested
+O -> O : notification_id = UUIDv5(producer, idempotency_key)
+O -> R : настройки, контакты, устройства
+R --> O : основной канал push, токен активен,\nразрешение ОС есть
+O -> O : рендеринг шаблона; план:\npush (T = 10 с) → SMS (T = 60 с) → email
+O -> DB : BEGIN\nINSERT ntf_dedup ON CONFLICT DO NOTHING\nINSERT notification (DISPATCHING, step 1, version 1)\nINSERT attempt #1 push (QUEUED, deadline = now + 10 с)\nINSERT outbox (SendPush, StatusChanged)\nCOMMIT
+note right of DB
+  Если ntf_dedup уже содержит id,
+  это повтор продюсера: ROLLBACK,
+  offset коммитится, отправки нет.
+end note
+O -> K : commit offset
+
+== Отправка ==
+OR -> DB : чтение WAL (logical decoding)
+OR -> K : ntf.cmd.push.tx (key = notification_id)
+K -> PS : SendPush(attempt #1, not_after)
+PS -> APNS : send(apns-collapse-id / tag = notification_id)
+APNS --> PS : 200 OK
+PS -> K : ntf.tx.events: AttemptSubmitted(#1)
+K -> O : AttemptSubmitted(#1)
+O -> DB : UPDATE attempt SET state = SUBMITTED\nWHERE id = #1 AND state = QUEUED
+
+== Подтверждение ==
+APNS -> APP : push
+APP -> RC : POST /v1/acks {notification_id, attempt_id}\n(NSE на iOS, FirebaseMessagingService на Android)
+RC -> K : ntf.tx.events: ReceiptReceived(#1, DELIVERED)
+K -> O : ReceiptReceived(#1)
+O -> DB : BEGIN\nUPDATE notification SET state = DELIVERED,\n  delivered_via = push, version = 2\n  WHERE id = … AND version = 1\nUPDATE attempt #1 SET state = DELIVERED\nINSERT outbox (StatusChanged)\nCOMMIT
+note right of DB
+  Попытка больше не активна:
+  частичный индекс дедлайнов её не видит,
+  таймаут не сработает.
+end note
+OR -> K : ntf.status: DELIVERED via push
+note over K : ntf.status → ClickHouse (история, отчёты)\nи продюсеру (финальный статус)
+@enduml

@@ -1,0 +1,80 @@
+@startuml a-seq-failover
+title Вариант 1. Failover: push не подтверждён → SMS (провайдер A отказал → B), позднее подтверждение push
+autonumber
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign left
+
+participant "Push Sender" as PS
+participant "APNs / FCM" as APNS
+actor "Приложение" as APP
+participant "Timer Worker" as TW
+database "Delivery DB" as DB
+participant "Outbox Relay" as OR
+queue "Kafka" as K
+participant "Delivery\nOrchestrator" as O
+participant "SMS Sender" as SS
+database "Redis" as R
+participant "SMS-провайдер A" as SA
+participant "SMS-провайдер B" as SB
+participant "Receipt\nCollector" as RC
+
+== t = 0: попытка #1 (push) передана провайдеру, deadline = t + 10 с ==
+PS -> APNS : send(collapse-id = notification_id)
+APNS --> PS : 200 OK
+PS -> K : AttemptSubmitted(#1)
+note over APP : устройство вне сети\nили приложение выгружено ОС
+
+... 10 с без подтверждения ...
+
+== t ≈ 10 с: таймаут push ==
+TW -> DB : BEGIN\nSELECT … FROM delivery_attempt\n  WHERE state IN (QUEUED, SUBMITTED) AND deadline_at <= now()\n  ORDER BY deadline_at LIMIT 500 FOR UPDATE SKIP LOCKED\nUPDATE attempt #1 SET state = TIMED_OUT\nUPDATE notification SET step = 2, version = v + 1\n  WHERE id = … AND version = v AND state = DISPATCHING\nINSERT attempt #2 sms (QUEUED, deadline = now + 60 с)\nINSERT outbox (SendSms, StatusChanged)\nCOMMIT
+note right of TW
+  Тот же код автомата, что в оркестраторе.
+  CAS по version: если ack уже обработан,
+  UPDATE вернёт 0 строк → ROLLBACK,
+  SMS не создаётся.
+end note
+OR -> K : ntf.cmd.sms.tx
+K -> SS : SendSms(attempt #2, not_after)
+SS -> R : GET cancel:{attempt #2}
+R --> SS : нет флага
+
+== Отказ провайдера A внутри канала SMS ==
+SS -> SA : send(client_ref = attempt #2)
+SA --> SS : таймаут 2 с
+SS -> SA : GET status(client_ref)
+SA --> SS : 503
+SS -> SS : circuit breaker A → OPEN;\nntf_sms_ambiguous_total{provider=A} += 1
+note right of SS
+  Неоднозначный отказ: статус неизвестен.
+  ASR-1 важнее ASR-3: отправляем через B,
+  возможный дубль учитывается метрикой.
+end note
+SS -> SB : send(client_ref = attempt #2)
+SB --> SS : 202 Accepted (provider_message_id)
+SS -> K : AttemptSubmitted(#2, provider = B)
+K -> O : AttemptSubmitted(#2)
+O -> DB : UPDATE attempt #2 SET state = SUBMITTED\nWHERE state = QUEUED
+
+== Доставка по SMS ==
+SB -> RC : DLR DELIVERED (client_ref = attempt #2)
+RC -> K : ReceiptReceived(#2, DELIVERED)
+K -> O : ReceiptReceived(#2)
+O -> DB : BEGIN\nnotification → DELIVERED (sms) [CAS по version]\nattempt #2 → DELIVERED\nINSERT outbox (StatusChanged)\nCOMMIT
+
+== t ≈ 14 с: позднее подтверждение push ==
+APP -> RC : POST /v1/acks {attempt #1}
+RC -> K : ReceiptReceived(#1, DELIVERED)
+K -> O : ReceiptReceived(#1)
+O -> DB : UPDATE attempt #1 SET late_delivered_at = now()\n(уведомление уже DELIVERED: новых команд нет)
+O -> O : ntf_late_ack_total{channel=push} += 1
+
+== Альтернатива: ack по push пришёл до отправки SMS ==
+alt SendSms ещё в очереди Kafka
+  O -> DB : notification → DELIVERED (push) [CAS];\nattempt #2 → CANCELLED
+  O -> R : SET cancel:{attempt #2} EX 3600
+  SS -> R : GET cancel:{attempt #2}
+  R --> SS : CANCELLED
+  SS -> SS : SMS не отправляется
+end
+@enduml
