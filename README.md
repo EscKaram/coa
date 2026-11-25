@@ -12,9 +12,10 @@
 | 2 | [`hw2`](../../tree/hw2) | Marketplace: OpenAPI + CRUD, кодогенерация, PostgreSQL + Flyway, бизнес-логика заказов, JWT, роли |
 | 3 | [`hw3`](../../tree/hw3) | Flight Booking: два микросервиса, gRPC-контракт и кодогенерация, PostgreSQL + Flyway, кеш в Redis Sentinel, retry и circuit breaker |
 | 4 | [`hw4`](../../tree/hw4) | Notification Platform: требования, ASR, архитектурные вопросы и риски; RFC о гарантированной доставке с кросс-канальным failover (C4, sequence-диаграммы, расчёт нагрузки) |
+| 5 | [`hw5`](../../tree/hw5) | Online Cinema: Kafka (2 брокера, Avro + Schema Registry), продюсер с генератором событий, ClickHouse Kafka Engine, сервис агрегации (DAU, конверсия, retention) с выгрузкой в PostgreSQL, Grafana с когортной heatmap, экспорт в S3 (MinIO) |
 
 Условие задания и инструкция по запуску находятся в `README.md` соответствующей ветки. ДЗ 4 — проектный документ без запускаемого кода.
 
 ```bash
-git checkout hw4
+git checkout hw5
 ```
