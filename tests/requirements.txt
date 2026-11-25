@@ -1,0 +1,8 @@
+pytest==8.3.5
+requests==2.32.3
+confluent-kafka[avro,schemaregistry]==2.10.0
+fastavro==1.10.0
+authlib==1.6.12
+httpx==0.28.1
+psycopg[binary]==3.2.9
+boto3==1.38.23

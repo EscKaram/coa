@@ -1,0 +1,8 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+pydantic==2.11.4
+confluent-kafka[avro,schemaregistry]==2.10.0
+fastavro==1.10.0
+# Транзитивные зависимости клиента Schema Registry, закреплены явно.
+authlib==1.6.12
+httpx==0.28.1

@@ -1,0 +1,352 @@
+name: online-cinema
+
+# Учётные данные ниже — только для локального запуска.
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:3.9.1
+  restart: unless-stopped
+
+# Общие настройки узлов KRaft. Кворум контроллеров — 3 голосующих узла (kafka-1, kafka-2, kafka-controller):
+# остановка любого одного узла не останавливает кластер.
+x-kafka-env: &kafka-env
+  CLUSTER_ID: VWsISct5TeGFr8IIkCbF7A
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-controller:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+
+# Настройки брокеров: внутренние топики реплицируются на оба брокера, топики создаются только явно.
+x-broker-env: &broker-env
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+  KAFKA_MIN_INSYNC_REPLICAS: 1
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+x-broker-healthcheck: &broker-healthcheck
+  test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
+  interval: 10s
+  timeout: 10s
+  retries: 12
+  start_period: 20s
+
+services:
+  # ---------- Kafka: 2 брокера + выделенный контроллер (KRaft, без ZooKeeper) ----------
+  kafka-1:
+    <<: *kafka-common
+    hostname: kafka-1
+    environment:
+      <<: [*kafka-env, *broker-env]
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:19092,EXTERNAL://localhost:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+    healthcheck: *broker-healthcheck
+
+  kafka-2:
+    <<: *kafka-common
+    hostname: kafka-2
+    environment:
+      <<: [*kafka-env, *broker-env]
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:19092,EXTERNAL://localhost:9094
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+    healthcheck: *broker-healthcheck
+
+  # Третий голос кворума метаданных; сообщения не хранит.
+  kafka-controller:
+    <<: *kafka-common
+    hostname: kafka-controller
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: controller
+      KAFKA_LISTENERS: CONTROLLER://:9093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx256m
+    volumes:
+      - kafka-controller-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-controller localhost:9093 describe --status >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.1
+    hostname: schema-registry
+    restart: unless-stopped
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka-1:19092,PLAINTEXT://kafka-2:19092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 2
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+      SCHEMA_REGISTRY_HEAP_OPTS: -Xms128m -Xmx256m
+    ports:
+      - "8081:8081"
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # Однократно: топик movie-events (3 партиции, RF=2, min.insync.replicas=1) и схемы v1, v2.
+  pipeline-init:
+    build:
+      context: .
+      dockerfile: movie-service/Dockerfile
+    image: online-cinema/movie-service:1.0.0
+    command: ["python", "-m", "app.bootstrap"]
+    environment: &movie-kafka-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka-1:19092,kafka-2:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_TOPIC: movie-events
+      SCHEMA_SUBJECT: movie-events-value
+    healthcheck:
+      disable: true
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+
+  # ---------- ClickHouse ----------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    hostname: clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: cinema
+      CLICKHOUSE_USER: cinema
+      CLICKHOUSE_PASSWORD: cinema
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ./clickhouse/config.d/cinema.xml:/etc/clickhouse-server/config.d/cinema.xml:ro
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user cinema --password cinema --query 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Однократно: миграции clickhouse/migrations/*.sql (таблицы, Kafka Engine, materialized views, агрегаты).
+  clickhouse-migrations:
+    image: clickhouse/clickhouse-server:24.8
+    entrypoint: ["/bin/sh", "/migrate.sh"]
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_USER: cinema
+      CLICKHOUSE_PASSWORD: cinema
+      KAFKA_BROKER_LIST: kafka-1:19092,kafka-2:19092
+      KAFKA_TOPIC: movie-events
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      GRAFANA_CLICKHOUSE_PASSWORD: grafana
+    volumes:
+      - ./clickhouse/migrate.sh:/migrate.sh:ro
+      - ./clickhouse/migrations:/migrations:ro
+    healthcheck:
+      disable: true
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      pipeline-init:
+        condition: service_completed_successfully
+
+  # ---------- PostgreSQL: готовые метрики ----------
+  postgres:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: analytics
+      POSTGRES_USER: analytics
+      POSTGRES_PASSWORD: analytics
+    ports:
+      - "5436:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U analytics -d analytics"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  postgres-migrations:
+    image: flyway/flyway:10.20.1
+    command: >
+      -url=jdbc:postgresql://postgres:5432/analytics -user=analytics -password=analytics
+      -locations=filesystem:/flyway/sql -connectRetries=10 migrate
+    volumes:
+      - ./aggregation-service/migrations:/flyway/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------- S3: MinIO ----------
+  # Официальные образы minio/minio больше не публикуются в Docker Hub; используется сборка MinIO от Bitnami.
+  minio:
+    image: bitnamilegacy/minio:2025.7.23
+    hostname: minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_DEFAULT_BUCKETS: movie-analytics
+    ports:
+      - "9002:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # ---------- Сервисы ----------
+  movie-service:
+    image: online-cinema/movie-service:1.0.0
+    build:
+      context: .
+      dockerfile: movie-service/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *movie-kafka-env
+      SCHEMA_VERSION: latest
+      PUBLISH_MAX_ATTEMPTS: 5
+      PUBLISH_RETRY_BASE_MS: 200
+      PUBLISH_RETRY_MAX_MS: 5000
+      PUBLISH_DELIVERY_TIMEOUT_MS: 10000
+      GENERATOR_ENABLED: ${GENERATOR_ENABLED:-true}
+      GENERATOR_SEED: 42
+      GENERATOR_BACKFILL_DAYS: 10
+      GENERATOR_NEW_USERS_PER_DAY: 300
+      GENERATOR_MOVIES: 40
+    ports:
+      - "8000:8000"
+    depends_on:
+      pipeline-init:
+        condition: service_completed_successfully
+      clickhouse-migrations:
+        condition: service_completed_successfully
+
+  aggregation-service:
+    build: ./aggregation-service
+    image: online-cinema/aggregation-service:1.0.0
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: cinema
+      CLICKHOUSE_PASSWORD: cinema
+      POSTGRES_DSN: postgresql://analytics:analytics@postgres:5432/analytics
+      AGG_INTERVAL_SECONDS: ${AGG_INTERVAL_SECONDS:-60}
+      AGG_LOOKBACK_DAYS: 8
+      TOP_MOVIES_LIMIT: 10
+      EXPORT_INTERVAL_SECONDS: ${EXPORT_INTERVAL_SECONDS:-300}
+      EXPORT_LOOKBACK_DAYS: 7
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: movie-analytics
+    ports:
+      - "8001:8001"
+    depends_on:
+      clickhouse-migrations:
+        condition: service_completed_successfully
+      postgres-migrations:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+
+  grafana:
+    build: ./grafana
+    image: online-cinema/grafana:11.6.0-clickhouse-4.23.5
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/cinema.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Без автоустановки встроенных плагинов с grafana.com при старте: нужный плагин ClickHouse уже в образе.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      clickhouse-migrations:
+        condition: service_completed_successfully
+
+  # ---------- Тесты: docker compose --profile test run --rm tests ----------
+  tests:
+    profiles: ["test"]
+    build: ./tests
+    image: online-cinema/tests:1.0.0
+    environment:
+      MOVIE_SERVICE_URL: http://movie-service:8000
+      AGGREGATION_SERVICE_URL: http://aggregation-service:8001
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: cinema
+      CLICKHOUSE_PASSWORD: cinema
+      KAFKA_BOOTSTRAP_SERVERS: kafka-1:19092,kafka-2:19092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      POSTGRES_DSN: postgresql://analytics:analytics@postgres:5432/analytics
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: movie-analytics
+      GRAFANA_URL: http://grafana:3000
+    depends_on:
+      movie-service:
+        condition: service_healthy
+      aggregation-service:
+        condition: service_healthy
+      grafana:
+        condition: service_healthy
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-controller-data:
+  clickhouse-data:
+  postgres-data:
+  minio-data:
+  grafana-data:

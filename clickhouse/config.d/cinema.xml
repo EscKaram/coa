@@ -1,0 +1,14 @@
+<!-- Настройки сервера ClickHouse для конвейера кинотеатра. -->
+<clickhouse>
+    <!-- Все даты и время в UTC: event_date = toDate(timestamp) считается по UTC. -->
+    <timezone>UTC</timezone>
+
+    <logger>
+        <level>information</level>
+    </logger>
+
+    <!-- Глобальные настройки librdkafka для движка Kafka: новая группа потребителей читает топик с начала. -->
+    <kafka>
+        <auto_offset_reset>earliest</auto_offset_reset>
+    </kafka>
+</clickhouse>

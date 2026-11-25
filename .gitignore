@@ -4,3 +4,7 @@ __pycache__/
 .idea/
 .vscode/
 .DS_Store
+
+# Сохранённые страницы курса и код, сгенерированный в ДЗ 3
+*.mhtml
+generated/

@@ -1,0 +1,17 @@
+# Источник данных ClickHouse. Пользователь grafana имеет SELECT только на таблицы агрегатов (cinema.agg_*).
+apiVersion: 1
+datasources:
+  - name: ClickHouse
+    uid: clickhouse
+    type: grafana-clickhouse-datasource
+    isDefault: true
+    editable: false
+    jsonData:
+      host: clickhouse
+      port: 8123
+      protocol: http
+      secure: false
+      username: grafana
+      defaultDatabase: cinema
+    secureJsonData:
+      password: grafana
